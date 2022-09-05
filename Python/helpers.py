@@ -72,6 +72,9 @@ class anova():
 def drop1():
     pass
 
+def add1():
+    pass
+
 def step(model, scope, direction='backward'):
     #https://medium.com/@garrettwilliams90/stepwise-feature-selection-for-statsmodels-fda269442556
     pass
