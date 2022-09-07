@@ -13,6 +13,7 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 from typing import Type
 import copy
 import math
+import warnings
 
 
 # https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/anova.glm
@@ -22,25 +23,39 @@ class Anova():
        Note that this object does not perform one-way or any other type of anova testing it only serves for comparing GLM models
     """
     def __init__(self):
-        self.__res = {}
+        self.__res = pd.DataFrame(data={})
 
     @property
     def res(self):
         return self.__res
         
     def __call__(self, *models, test='chisq', dispersion=False):
-        # TODO add name of variable into index of dataframe
         if len(models) == 1:
-            """Testing quality of model"""
-            # TODO R anova performs test of significance for every variable in model against nested submodel so this needs to be fixed !!! 
-            m = []
-            mod_null = copy.deepcopy(models[0])
-            mod_null.model.exog = models[0].model.exog[:, 0][:, None]
-            m.append(mod_null.model.fit())
-            m.append(models[0])
-            m[0].df_model = 0 
-            m[0].df_resid += 1
-            pairs = self._pairs_(*m)
+            """Testing all submodels"""
+
+            link = models[0].model.family.link
+            var_weights = models[0].model.var_weights
+            offset = None
+            if hasattr(models[0].model, 'offset'):
+                offset = models[0].model.offset
+            family = models[0].model.family
+            exog = models[0].model.exog
+            un = None
+            if hasattr(models[0].params, 'index'):
+                var_names = list(models[0].params.index)
+                vv = [i.split('_')[0] for i in var_names]
+                indexes = np.unique(vv, return_index=True)[1]
+                un = [vv[index] for index in sorted(indexes)]
+                
+
+                sub_mod_vars = [np.isin(vv, un[:i]) for i in range(1, len(un)+1)]
+                sub_mods = [sm.GLM(endog=models[0].model.endog, exog=exog[:, i], family=family, var_weights=var_weights, offset=offset).fit() for i in sub_mod_vars]
+            else:
+                sub_mods = [sm.GLM(endog=models[0].model.endog, exog=exog[:, :i], family=family, var_weights=var_weights, offset=offset).fit() for i in range(1, exog.shape[1]+1)]
+
+
+            pairs = self._pairs_(*sub_mods)
+
 
         elif len(models) > 1:
             """Comparing models"""
@@ -50,22 +65,43 @@ class Anova():
 
     
         out = [self._choice(*i, test=test, dispersion=dispersion) for i in pairs]
-        res = {k: [v if 'resid' in k else np.nan] for k, v in out[0].items()}
-        for i, j in enumerate(out):
-            for k, v in j.items():
-                if 'resid' in k:
-                    c = k.split('_')[1]
-                    res[k].append(res[k][-1] - j[c])
-                elif 'resid' not in k:
-                    res[k].append(v)
+        
+        if test.lower() == 'cp':
+            res = {k: [v if 'resid' in k else v[0] if 'cp' in k else np.nan] for k, v in out[0].items()}
+            for i, j in enumerate(out):
+                for k, v in j.items():
+                    if 'resid' in k:
+                        c = k.split('_')[1]
+                        res[k].append(res[k][-1] - j[c])
+                    elif 'resid' not in k and 'cp' not in k:
+                        res[k].append(v)
+                    elif 'cp' in k:
+                        res[k].append(v[1])
+
+                    
+        else:
+            res = {k: [v if 'resid' in k else np.nan] for k, v in out[0].items()}
+            for i, j in enumerate(out):
+                for k, v in j.items():
+                    if 'resid' in k:
+                        c = k.split('_')[1]
+                        res[k].append(res[k][-1] - j[c])
+                    elif 'resid' not in k:
+                        res[k].append(v)
+
         self.__res = pd.DataFrame(data=res)
+
+        if len(models) == 1:
+            if un is not None:
+                self.__res = self.__res.set_index([pd.Index(un, dtype='object')])
+            else:
+                self.__res = self.__res.set_index([pd.Index([f'x{i}' for i in range(0, exog.shape[1])], dtype='object')])
         #display(self.__res)
         return self.__res
     
     def __repr__(self) -> str:
         return repr(self.__res)
-    def _warnings(self):
-        pass
+
     def _choice(self, *models, test, dispersion):
         if test.lower() in ('chisq'.lower(), 'lrt'):
             res = self._chisq_(*models)
@@ -74,13 +110,13 @@ class Anova():
         elif test.lower() == 'rao':
             res = self._rao_(*models)
         elif test.lower() == 'cp':
-            res = self._cp_()
+            res = self._cp_(*models)
         else:
             raise Exception(f'Not such test implemented: {test}')
         return res
 
     def _pairs_(self, *models):
-        return [[models[i], models[i+1]] for i in range(math.ceil(len(models) / 2))]
+        return [[models[i], models[i+1]] for i in range(len(models) -1)]
 
     def _F_(self, *models, dispersion=False):
         """Performs deviance F-test most appropriate when scale param (phi) is not known"""
@@ -88,11 +124,11 @@ class Anova():
         if models[0].df_model > models[-1].df_model:
             phi_hat = models[0].scale
         if isinstance(dispersion, bool) and dispersion:
-            # pearson estimate of scale factor
-            phi_hat  = models[-1].deviance / (models[-1].nobs - models[-1].df_model)
+            # deviance estimate of scale factor
+            phi_hat  = models[-1].deviance / models[-1].df_resid
         elif isinstance(dispersion, float):
             phi_hat = dispersion
-        print(dispersion, phi_hat, isinstance(dispersion, int), isinstance(dispersion, float))
+
         f_stat = (models[0].deviance - models[-1].deviance) / ((models[-1].df_model - models[0].df_model)* phi_hat)
         p_val = scipy.stats.f.sf(f_stat, dfn=np.abs(models[-1].df_model - models[0].df_model), 
                                  dfd=np.abs(models[-1].nobs - models[-1].df_model))
@@ -105,7 +141,9 @@ class Anova():
         Note that if disperzion param is not known then deviance LRT test leads to F test and
         performing Chisq test is inappropriate
         """
-        phi_hat = 1 # models[-1].scale TODO it seems that R-anova always uses scale =1 in lrt test
+        phi_hat = models[-1].scale
+        if models[0].df_model > models[-1].df_model:
+            phi_hat = models[0].scale
         chi2_stat = np.abs((models[0].deviance - models[-1].deviance) / phi_hat)  
         p_val = scipy.stats.chi2.sf(chi2_stat, df=np.abs(models[-1].df_model - models[0].df_model))
 
@@ -114,19 +152,30 @@ class Anova():
 
     def _rao_(self, *models):
         """Performs rao score test"""
-        phi_hat = 1 # models[-1].scale TODO it seems that R-anova always uses scale =1 in rao test
-        scores = [i.resid_response / i.model.family.variance(i.predict()) for i in models]
-        raos = [i.T  @ np.diag(j.model.family.variance(j.predict())) @ i for i, j in zip(scores, models)]
+        # TODO possible incorrect
+        phi_hat = models[-1].scale
+        if models[0].df_model > models[-1].df_model:
+            phi_hat = models[0].scale
+       
+        raos = [i.resid_pearson.T @ i.resid_pearson for i in models] #
+        # reference: https://link.springer.com/content/pdf/10.1007/BF02763005.pdf
         
-        chi2_stat = np.abs((raos[0] - raos[-1]) / phi_hat)  
-        p_val = scipy.stats.chi2.sf(chi2_stat, df=np.abs(models[-1].df_model - models[0].df_model))
+        #scores = [i.resid_response / i.model.family.variance(i.predict()) for i in models]  # calculates score vectors for both models
+        #raos = [i.T  @ (np.diag(j.model.family.variance(j.predict())) ) @ i for i, j in zip(scores, models)] # calculates rao statistic for both models ()
+
+        chi2_stat = (raos[0] - raos[-1])
+        p_val = scipy.stats.chi2.sf(np.abs(chi2_stat) / phi_hat, df=np.abs(models[-1].df_model - models[0].df_model))
+
+        warnings.warn("Note that rao score statistic may be inccorect. Currently it is Generalized Pearson statistic")
 
         return {'resid_df': models[0].df_resid, 'resid_deviance':  models[0].deviance, 'df': models[-1].df_model - models[0].df_model, 'deviance': models[0].deviance - models[-1].deviance,
-                'rao_chi2': chi2_stat,'p_val': p_val}
+                'rao': chi2_stat,'p_val': p_val}
 
     def _cp_(self, *models):
         """No p-values just Cp values"""
-        pass
+        
+        return {'resid_df': models[0].df_resid, 'resid_deviance':  models[0].deviance, 'df': models[-1].df_model - models[0].df_model, 'deviance': models[0].deviance - models[-1].deviance,
+                'cp': [i.deviance + 2*i.scale*i.df_model for i in models]}
 
 
 def drop1():
